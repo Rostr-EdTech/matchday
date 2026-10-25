@@ -1,0 +1,51 @@
+# Render Blueprint — see README.md's "Deploying to Render" section for the
+# full walkthrough. Connect this repo in the Render dashboard (New →
+# Blueprint) and it provisions both the web service and its Postgres
+# database from this one file.
+#
+# The committed prisma/schema.prisma stays on `provider = "sqlite"` so
+# local dev (`npm run dev`) keeps working with zero setup — buildCommand
+# below flips that one line to "postgresql" in the BUILD CONTAINER only
+# (never committed back to the repo) before generating the client, since
+# Prisma has no per-environment provider switch. See CONTEXT.md for why.
+services:
+  - type: web
+    name: matchday
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: sed -i 's/provider = "sqlite"/provider = "postgresql"/' prisma/schema.prisma && npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    # Applies any pending (non-destructive) schema changes to the database
+    # before the new instance starts. Refuses and fails the deploy — rather
+    # than silently dropping data — if a change would lose data; that case
+    # needs a human to run the migration by hand (see README). Then
+    # (re-)upserts the 6 built-in formation presets — global reference data
+    # a coach needs even if they never run the full demo seed (see
+    # prisma/seed-formations.ts) — so every deploy keeps them present.
+    preDeployCommand: npx prisma db push && npx tsx prisma/seed-formations.ts
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: matchday-db
+          property: connectionString
+      - key: AUTH_SECRET
+        sync: false
+      - key: NEXTAUTH_URL
+        sync: false
+      - key: ALLOWED_EMAIL_DOMAIN
+        sync: false
+      - key: GMAIL_SMTP_USER
+        sync: false
+      - key: GMAIL_SMTP_APP_PASSWORD
+        sync: false
+
+databases:
+  - name: matchday-db
+    databaseName: matchday
+    user: matchday
+    plan: free
+    region: oregon

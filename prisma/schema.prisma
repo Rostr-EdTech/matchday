@@ -1,0 +1,570 @@
+// Prisma schema for Matchday — a soccer team-management platform (roster,
+// formations/lineups, match substitution planning).
+//
+// Forked from class_copilot (see ../CONTEXT.md for the domain mapping and why
+// this base was chosen over the CRM root scaffold). User/AllowedEmail/
+// Task/Feedback/ActivityLog/Notification/Setting/UserPreference carry over
+// structurally unchanged (FK names relabeled). Class/Student/Enrollment/
+// ClassCoTeacher/StudentInvite become Team/Athlete/RosterSpot/
+// TeamAssistantCoach/AthleteInvite. Every academic subsystem (Standards,
+// Mastery, Grading, Assignments, Practice Mode, AI) is dropped — no coaching
+// equivalent. Formation/Lineup/LineupSlot/Match/MatchAppearance are new: the
+// actual point of this app (see CONTEXT.md).
+//
+// NOTE ON ENUMS: SQLite (the local dev database) does not support Prisma
+// `enum` types. To keep the local setup friction-free while staying
+// PostgreSQL-ready, all "enum" fields are modelled as `String`. The set of
+// allowed values for each is defined and validated in `src/lib/enums.ts`.
+// When migrating to PostgreSQL you can promote these to real enums.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  // LOCAL-FIRST: SQLite for local development (no online services needed).
+  // To go online later, switch provider to "postgresql", restore a pooled
+  // url + directUrl, and `prisma db push` — the enums-as-String pattern above
+  // keeps the schema portable, so that's the only change needed.
+  provider = "sqlite"
+  url      = env("DATABASE_URL") // e.g. file:./dev.db locally
+}
+
+model User {
+  id                 String   @id @default(cuid())
+  name               String
+  email              String   @unique
+  passwordHash       String
+  role               String   @default("ASSISTANT") // OWNER (Head Coach) | ASSISTANT (Assistant Coach) | CLIENT (Athlete)
+  active             Boolean  @default(true) // deactivated users cannot log in
+  mustChangePassword Boolean  @default(false) // forces a reset on next login
+  // Bumped whenever the account's access changes (role/deactivation/etc.) so a
+  // stale short-lived JWT can be invalidated on the next request (see auth.ts).
+  sessionVersion     Int      @default(0)
+  // ASSISTANT (Assistant Coach) flag: grant access to ALL of the owning head
+  // coach's teams without per-team TeamAssistantCoach rows.
+  allClientsAccess   Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  // Workspace this account belongs to. Null for OWNER — an OWNER IS a
+  // workspace root (their own program), not a member of one. Set on
+  // ASSISTANT rows to the OWNER who created them (src/actions/users.ts).
+  // Not used for CLIENT (an Athlete login) — those are scoped via
+  // Athlete.createdByUserId/RosterSpot instead. See src/lib/access.ts.
+  ownerId String?
+  owner   User?   @relation("WorkspaceOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  assistants User[] @relation("WorkspaceOwner")
+
+  // If role = CLIENT, this is the login account for exactly one Athlete record.
+  athleteAccount Athlete? @relation("AthleteLogin")
+
+  // If role = ASSISTANT, a pending self-service invite letting them set
+  // their own password instead of using the coach-issued temp one. See
+  // AssistantInvite below.
+  assistantInvite AssistantInvite?
+
+  // If role = ASSISTANT, the teams this assistant coach is assigned to.
+  assistantCoachAssignments TeamAssistantCoach[] @relation("AssistantCoachAssignments")
+
+  // Teams this user coaches (role = OWNER in practice).
+  teamsCoached Team[] @relation("TeamCoach")
+
+  tasksAssigned    Task[]         @relation("TaskAssignedTo")
+  tasksCreated     Task[]         @relation("TaskCreatedBy")
+  feedbackGiven    Feedback[]
+  feedbackDeleted  Feedback[]     @relation("FeedbackDeletedBy")
+  activityLogs     ActivityLog[]
+  notifications    Notification[]
+  preferences      UserPreference[]
+  settingsUpdated  Setting[]
+  athletesCreated  Athlete[]      @relation("AthleteCreatedBy")
+  lineupsCreated   Lineup[]
+  matchesCreated   Match[]
+  practicesCreated Practice[]
+
+  // If this account's email matched a preloaded roster row, the row it claimed.
+  claimedAllowedEmail AllowedEmail?  @relation("AllowedEmailClaimedBy")
+  allowedEmailsAdded  AllowedEmail[] @relation("AllowedEmailAddedBy")
+}
+
+// A preloaded, program-verified roster of email addresses allowed to sign up
+// (STAFF, via /signup) or claim an athlete portal invite (ATHLETE). Closes
+// two related risks: open signup letting anyone create a head-coach account,
+// and a rogue coach pre-claiming a real athlete's email. Bootstrap-friendly:
+// enforcement of each role only activates once at least one row of that role
+// exists — an empty table doesn't lock anyone out before an admin has had a
+// chance to preload it (see src/lib/allowed-email.ts).
+model AllowedEmail {
+  id    String @id @default(cuid())
+  email String @unique
+  role  String // STAFF | ATHLETE
+
+  // Which account ended up claiming this row (informational/audit only — the
+  // real gate is the row's existence + role, checked at signup/invite-accept
+  // time, not this field).
+  claimedByUserId String? @unique
+  claimedBy       User?   @relation("AllowedEmailClaimedBy", fields: [claimedByUserId], references: [id], onDelete: SetNull)
+
+  addedById String?
+  addedBy   User?    @relation("AllowedEmailAddedBy", fields: [addedById], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+
+  @@index([role])
+}
+
+// The athlete a coach tracks — a FIRST-CLASS entity, independent of any one
+// team (a player can move between teams/age groups season to season).
+// Everything roster-scoped (tasks, feedback, activity, roster spots, match
+// appearances) is scoped to an Athlete.
+model Athlete {
+  id          String    @id @default(cuid())
+  displayName String
+  dateOfBirth DateTime?
+  jerseyNumber Int?
+  // From src/lib/enums.ts::SOCCER_POSITIONS, e.g. "CB". Free string (not a
+  // Prisma enum, see the file header) so a new position label is a one-line
+  // enums.ts change, not a migration.
+  primaryPosition    String?
+  // JSON array string of additional SOCCER_POSITIONS this athlete can cover
+  // — same SQLite-friendly "list as JSON string" trick the source CRM used
+  // for Client.targetTitles etc.
+  secondaryPositions String?
+  dominantFoot       String? // LEFT | RIGHT | BOTH
+  status             String  @default("ACTIVE") // ACTIVE | INACTIVE | ARCHIVED
+  // At-a-glance availability, separate from `status` (roster membership).
+  // Manually set and cleared by a coach/trainer — see src/lib/enums.ts.
+  injuryStatus    String    @default("HEALTHY") // HEALTHY | QUESTIONABLE | OUT
+  injuryNote      String?
+  injuryUpdatedAt DateTime?
+  notes           String? // coach-only private notes
+
+  // The login account for this athlete (nullable — an athlete can exist
+  // before you invite them to the portal). One User <-> one Athlete.
+  linkedUserId String?  @unique
+  linkedUser   User?    @relation("AthleteLogin", fields: [linkedUserId], references: [id], onDelete: SetNull)
+
+  // Which head coach's workspace this roster row belongs to (the OWNER who
+  // created it) — lets a not-yet-rostered athlete still be visible to
+  // whoever created them, not just athletes already on a Team via
+  // RosterSpot. See src/lib/access.ts::accessibleAthleteIds.
+  createdByUserId String
+  createdBy       User   @relation("AthleteCreatedBy", fields: [createdByUserId], references: [id])
+
+  // Bulk-import / dedupe keys (roster CSV import).
+  email      String? @unique
+  externalId String? // club/league player id
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rosterSpots   RosterSpot[]
+  tasks         Task[]
+  feedback      Feedback[]
+  activityLogs  ActivityLog[]
+  notifications Notification[]
+  lineupSlots   LineupSlot[]
+  appearances   MatchAppearance[]
+  practiceAttendance PracticeAttendance[]
+
+  // Pending self-service portal invite (see AthleteInvite below). Null once
+  // accepted (the invite row is deleted) or if none was ever generated.
+  invite AthleteInvite?
+
+  @@index([status])
+  @@index([email])
+  @@index([injuryStatus])
+}
+
+// A one-time, expiring link a coach generates so an athlete can create their
+// OWN portal login (choose their own email + password) instead of the coach
+// setting a temp password by hand. At most one live invite per Athlete —
+// generating a new one replaces the old token. Deleted on accept.
+model AthleteInvite {
+  id        String   @id @default(cuid())
+  athleteId String   @unique
+  athlete   Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+// A one-time, expiring link letting an ALREADY-CREATED Assistant Coach
+// account set their own password instead of using the coach-issued temp
+// one — same self-service spirit as AthleteInvite above, but for an
+// account that already exists: an assistant coach's User row is created
+// immediately by the head coach (see actions/users.ts::createUser), unlike
+// an Athlete, which can exist with no login at all. Accepting this invite
+// doesn't create a new account, it just replaces that User's password and
+// clears mustChangePassword. At most one live invite per User — generating
+// a new one replaces the old token. Deleted on accept.
+model AssistantInvite {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+// A squad/roster a head coach runs, e.g. "Varsity Boys — 2026 Fall".
+model Team {
+  id        String   @id @default(cuid())
+  name      String
+  ageGroup  String? // free text, e.g. "U16", "Varsity"
+  season    String? // free text, e.g. "2026 Fall"
+  coachId   String
+  coach     User     @relation("TeamCoach", fields: [coachId], references: [id])
+  archived  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rosterSpots     RosterSpot[]
+  assistantCoaches TeamAssistantCoach[]
+  tasks           Task[]
+  matches         Match[]
+  lineups         Lineup[]
+  practices       Practice[]
+
+  @@index([coachId])
+}
+
+// Athlete <-> Team join (an athlete can be on more than one team/roster,
+// e.g. varsity + a club team tracked separately).
+model RosterSpot {
+  id        String   @id @default(cuid())
+  athleteId String
+  athlete   Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+  teamId    String
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  status    String   @default("ACTIVE") // ACTIVE | INACTIVE
+  joinedAt  DateTime @default(now())
+
+  @@unique([athleteId, teamId])
+  @@index([teamId])
+  @@index([athleteId])
+}
+
+// Many-to-many assignment linking an ASSISTANT (assistant coach) to a TEAM —
+// not to individual athletes. Athlete-level access for an assistant coach is
+// derived via RosterSpot (see src/lib/access.ts's 2-hop
+// accessibleAthleteIds), mirroring class_copilot's ClassCoTeacher pattern.
+model TeamAssistantCoach {
+  id                  String   @id @default(cuid())
+  teamId              String
+  team                Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  assistantCoachUserId String
+  assistantCoach      User     @relation("AssistantCoachAssignments", fields: [assistantCoachUserId], references: [id], onDelete: Cascade)
+  createdAt           DateTime @default(now())
+
+  @@unique([teamId, assistantCoachUserId])
+  @@index([assistantCoachUserId])
+}
+
+model Task {
+  id           String    @id @default(cuid())
+  title        String
+  description  String?
+  // Tasks can be athlete-specific, team-wide, or general (all nullable).
+  athleteId    String?
+  athlete      Athlete?  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+  teamId       String?
+  team         Team?     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  assignedToId String?
+  assignedTo   User?     @relation("TaskAssignedTo", fields: [assignedToId], references: [id])
+  createdById  String
+  createdBy    User      @relation("TaskCreatedBy", fields: [createdById], references: [id])
+  date         DateTime  @default(now())
+  recurring    Boolean   @default(false)
+  completed    Boolean   @default(false)
+  completedAt  DateTime?
+  notes        String?
+  evidenceUrl  String?
+  priority     String    @default("MEDIUM")
+  archived     Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([athleteId])
+  @@index([teamId])
+}
+
+// Coach/assistant-coach feedback for an athlete — a general note, not tied to
+// any specific piece of evidence (no MasteryEvent/DailyCheck equivalent in
+// this domain, so the attachment fields class_copilot's Feedback had are
+// dropped here — simpler model).
+model Feedback {
+  id          String    @id @default(cuid())
+  athleteId   String
+  athlete     Athlete   @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  message     String
+  // COACH_ONLY (staff only, the default) | ATHLETE_VISIBLE (explicitly shown
+  // to the athlete in their portal).
+  visibility  String    @default("COACH_ONLY")
+  createdAt   DateTime  @default(now())
+  // Edit / soft-delete audit trail. Deleted feedback is kept (not removed) so
+  // staff retain visibility of what was said and by whom.
+  editedAt    DateTime?
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("FeedbackDeletedBy", fields: [deletedById], references: [id])
+
+  @@index([athleteId])
+}
+
+model ActivityLog {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  // Athlete scope (nullable — some actions are general, e.g. user mgmt).
+  athleteId    String?
+  athlete      Athlete? @relation(fields: [athleteId], references: [id], onDelete: SetNull)
+  actionType   String
+  fieldChanged String?
+  oldValue     String?
+  newValue     String?
+  description  String?
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([athleteId])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  // Athlete this notification relates to (nullable for general pings).
+  athleteId String?
+  athlete   Athlete? @relation(fields: [athleteId], references: [id], onDelete: SetNull)
+  title     String
+  message   String
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, read])
+}
+
+// Admin-managed app-wide settings. Trimmed hard from class_copilot's version
+// (no AI/Canvas keys — nothing in this domain needs them): today the only
+// managed keys are the Gmail SMTP credentials that power invite emails (see
+// src/lib/email.ts, src/lib/settings.ts). `value` is encrypted ciphertext.
+model Setting {
+  key         String   @id // e.g. "GMAIL_SMTP_USER"
+  value       String
+  updatedById String?
+  updatedBy   User?    @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+  updatedAt   DateTime @updatedAt
+}
+
+// Per-user UI preferences (e.g. the current-team selection). Stored as a
+// key/value pair per user so settings follow the user across devices.
+model UserPreference {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key    String // e.g. "currentTeamId"
+  value  String // JSON string
+
+  @@unique([userId, key])
+}
+
+// A reusable formation template — global reference data (like class_copilot's
+// StandardCategory), not owned by any one team. Ships with ~6 common presets
+// (see prisma/seed.ts): 4-4-2, 4-3-3, 4-2-3-1, 3-5-2, 3-4-3, 5-3-2. No
+// in-app formation editor in v1 — that's a deliberate scope cut (see
+// CONTEXT.md); a Lineup below is where a coach actually customizes things.
+model Formation {
+  id        String   @id @default(cuid())
+  name      String   @unique // e.g. "4-3-3"
+  sport     String   @default("SOCCER") // scope is soccer-only in v1; field exists so a future sport isn't a schema change
+  // JSON array of { slotKey, positionLabel, x, y } — x/y are percentages
+  // (0-100) on a normalized pitch, attacking "up" (y=0 own goal line, y=100
+  // opponent's goal line). Exactly one slotKey has positionLabel "GK".
+  slotsJson String
+  createdAt DateTime @default(now())
+
+  lineups Lineup[]
+}
+
+// A saved board state for a Team — the persisted form of the drag-and-drop
+// tactical board. Optionally tied to a Match (a matchday lineup) or left
+// standalone (a coach experimenting with shape). Any roster athlete not
+// placed in a LineupSlot is implicitly "on the bench" — no separate bench
+// model. A brand-new Lineup starts with zero slots (a blank board) — a
+// Formation is an optional one-time "quick-fill" of placeholder slots
+// (see applyFormationTemplate), not a requirement to render or use the
+// board, and not the source of truth for slot positions once applied
+// (each LineupSlot carries its own concrete x/y from then on).
+model Lineup {
+  id             String     @id @default(cuid())
+  teamId         String
+  team           Team       @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  matchId        String?
+  match          Match?     @relation(fields: [matchId], references: [id], onDelete: SetNull)
+  // Informational only — which preset (if any) was last used to quick-fill
+  // this board's placeholder slots. Null for a board built entirely by
+  // freeform placement.
+  formationId    String?
+  formation      Formation? @relation(fields: [formationId], references: [id])
+  name           String     @default("Starting XI")
+  // Coach-ordered JSON array of athleteIds on the bench (display order only —
+  // an athlete's presence on the bench is really just "not in a LineupSlot").
+  benchOrderJson String?
+  // Sharing with the team: set together by shareLineup/cleared together by
+  // unshareLineup, so an old link stops working the moment a coach unshares
+  // rather than just being hidden from the UI. `notes` is the coach's
+  // game-plan message shown alongside the read-only board.
+  shareToken     String?    @unique
+  sharedAt       DateTime?
+  notes          String?
+  // The ball's position, same normalized 0-100 coordinate space as a
+  // LineupSlot. Both null = no ball on this board yet (see addBall).
+  ballX          Float?
+  ballY          Float?
+  createdById    String
+  createdBy      User       @relation(fields: [createdById], references: [id])
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  slots  LineupSlot[]
+  arrows LineupArrow[]
+
+  @@index([teamId])
+  @@index([matchId])
+}
+
+// A drawn pass or player-run arrow on a Lineup's board — the raw material
+// for the "play" animation (see src/components/board/formation-board.tsx),
+// which is a pure client-side visualization: playing it never writes back
+// to LineupSlot/ballX/ballY, it just temporarily animates the rendered
+// positions and then reverts, so replaying always starts from the same
+// drawn-up shape.
+model LineupArrow {
+  id        String   @id @default(cuid())
+  lineupId  String
+  lineup    Lineup   @relation(fields: [lineupId], references: [id], onDelete: Cascade)
+  kind      String   @default("PASS") // PASS (ball trajectory, solid) | RUN (player movement, dashed)
+  fromX     Float
+  fromY     Float
+  toX       Float
+  toY       Float
+  createdAt DateTime @default(now())
+
+  @@index([lineupId])
+}
+
+// One athlete's (or one empty placeholder's, or one opponent marker's)
+// position on a saved Lineup's board. x/y are percentages (0-100) on a
+// normalized full pitch — always a concrete, freely-draggable position,
+// never derived from a template at render time. `positionLabel` is
+// denormalized (copied from the Formation preset at quick-fill time, or
+// from the athlete's own primaryPosition when freely placed) so rendering
+// never needs to join back to a Formation. `side` distinguishes the
+// coach's own team from a sketched-in opponent shape (see
+// addOpponentFormation) — an OPPONENT slot never has an athleteId; it's a
+// generic marker, not tied to the roster.
+model LineupSlot {
+  id            String   @id @default(cuid())
+  lineupId      String
+  lineup        Lineup   @relation(fields: [lineupId], references: [id], onDelete: Cascade)
+  side          String   @default("US") // US | OPPONENT
+  positionLabel String?
+  athleteId     String?
+  athlete       Athlete? @relation(fields: [athleteId], references: [id], onDelete: SetNull)
+  x             Float
+  y             Float
+
+  @@index([lineupId])
+  @@index([athleteId])
+}
+
+// A scheduled or played game.
+model Match {
+  id            String   @id @default(cuid())
+  teamId        String
+  team          Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  opponent      String
+  date          DateTime
+  isHome        Boolean  @default(true)
+  periodCount   Int      @default(2) // e.g. 2 halves or 4 quarters
+  periodMinutes Int      @default(40) // length of each period, in minutes
+  notes         String?
+  status        String   @default("SCHEDULED") // SCHEDULED | COMPLETED | CANCELLED
+  createdById   String
+  createdBy     User     @relation(fields: [createdById], references: [id])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  lineups     Lineup[]
+  appearances MatchAppearance[]
+
+  @@index([teamId])
+}
+
+// The substitution/playing-time planner's core data: an interval, not a
+// paired sub-event. An athlete "on the field" from startMinute to endMinute
+// within a period is one row; a substitution is just two adjacent rows for
+// two different athletes at the same period/boundary minute. Total playing
+// time per athlete = sum of (endMinute - startMinute) across their rows,
+// clamped to periodMinutes when endMinute is null (still on at the buzzer) —
+// see src/lib/minutes.ts.
+model MatchAppearance {
+  id          String   @id @default(cuid())
+  matchId     String
+  match       Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  athleteId   String
+  athlete     Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+  periodIndex Int // 0-based
+  startMinute Int
+  endMinute   Int? // null = still on through the end of the period
+  slotKey     String? // position played, free label (e.g. "CB")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([matchId])
+  @@index([athleteId])
+}
+
+// One practice session for a Team, and the roster's attendance for it. A
+// coach can log any number of these (unlike Match, there's no opponent/
+// score — just "did the roster show up"). Kept deliberately separate from
+// MatchAppearance (matchday playing-time intervals) — attendance here is a
+// same-day present/late/absent mark, not a minute-by-minute timeline.
+model Practice {
+  id          String   @id @default(cuid())
+  teamId      String
+  team        Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  date        DateTime @default(now())
+  notes       String?
+  createdById String
+  createdBy   User     @relation(fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  attendance PracticeAttendance[]
+
+  @@index([teamId])
+}
+
+// One athlete's mark for one Practice. A row is created for every ACTIVE
+// roster athlete at practice-creation time (defaulting to PRESENT — a coach
+// taking attendance is marking the exceptions, not starting from a blank
+// slate), and reconciled (any athlete added to the roster since) the next
+// time the practice is opened — see getPracticeDetail. Never created for an
+// athlete who isn't (or is no longer) on that team's active roster.
+model PracticeAttendance {
+  id         String   @id @default(cuid())
+  practiceId String
+  practice   Practice @relation(fields: [practiceId], references: [id], onDelete: Cascade)
+  athleteId  String
+  athlete    Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+  status     String   @default("PRESENT") // PRESENT | LATE | ABSENT
+  updatedAt  DateTime @updatedAt
+
+  @@unique([practiceId, athleteId])
+  @@index([practiceId])
+  @@index([athleteId])
+}

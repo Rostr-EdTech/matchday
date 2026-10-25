@@ -1,0 +1,82 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Navy dark theme, matching the tactical board's own look (same navy as
+     the board page's panel, same blue as a home-team player token) so the
+     whole platform reads as one consistent surface rather than a light app
+     with one dark feature bolted on. Status/priority/injury colors
+     (BADGE_COLORS in src/lib/enums.ts) are deliberately left as light
+     pastel chips — they read as small "labels" against the dark chrome the
+     same way they did against white, and staying off this palette keeps
+     them from ever being mistaken for the brand accent. */
+  --background: 222 47% 8%;
+  --foreground: 210 40% 96%;
+  --card: 222 39% 14%;
+  --card-foreground: 210 40% 96%;
+  --primary: 221 83% 53%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 217 33% 20%;
+  --secondary-foreground: 210 40% 96%;
+  --muted: 217 33% 17%;
+  --muted-foreground: 215 20% 65%;
+  --accent: 217 33% 24%;
+  --accent-foreground: 210 40% 96%;
+  --border: 217 33% 24%;
+  --input: 217 33% 24%;
+  --ring: 221 83% 53%;
+  --radius: 0.75rem;
+}
+
+.dark {
+  --background: 258 30% 9%;
+  --foreground: 255 25% 94%;
+  --card: 258 25% 12%;
+  --card-foreground: 255 25% 94%;
+  --primary: 258 85% 66%;
+  --primary-foreground: 258 40% 10%;
+  --secondary: 258 20% 18%;
+  --secondary-foreground: 255 25% 90%;
+  --muted: 258 20% 16%;
+  --muted-foreground: 255 12% 65%;
+  --accent: 258 25% 20%;
+  --accent-foreground: 255 25% 92%;
+  --border: 258 20% 22%;
+  --input: 258 20% 24%;
+  --ring: 258 85% 66%;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Thin, unobtrusive scrollbars for the data tables */
+.scrollbar-thin::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 4px;
+}
+
+/* Digits line up in columns wherever grades/percentages/counts are shown. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
